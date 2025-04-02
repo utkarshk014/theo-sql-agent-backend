@@ -1,11 +1,10 @@
-# app/api/routes/connections.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 import uuid
 import psycopg2
 import psycopg2.extras
 import google.generativeai as genai
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.db.models import DatabaseConnection, User
@@ -25,12 +24,19 @@ class ConnectionResponse(BaseModel):
     name: str
     vector_db_url: str
     target_db_url: str
+    schema_status: Optional[str] = None
     
     class Config:
         from_attributes = True
 
 class ExtendedConnectionResponse(ConnectionResponse):
     schema_extraction: Dict[str, Any] = None
+
+class SchemaStatusResponse(BaseModel):
+    connection_id: uuid.UUID
+    name: str
+    status: str
+    error: Optional[str] = None
 
 def validate_db_url(db_url: str, db_type: str) -> Dict[str, Any]:
     """Validate if database URL is legitimate by attempting to connect"""
@@ -97,7 +103,8 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         all_schema_items = []
         
         # Process each table
-        for table_key, columns in tables.items():
+        for table_key, columns in enumerate(tables.items()):
+            table_key, columns = columns  # Unpack the tuple
             # Create table description
             table_desc = f"Table {table_key} with columns: {', '.join(col['column_name'] for col in columns)}"
             
@@ -165,20 +172,25 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
           column_name TEXT,
           data_type TEXT,
           description TEXT,
-          embedding vector({embedding_dimension}),
+          embedding vector({embedding_dimension})
         );
-        
-        -- Create index for faster similarity search if it doesn't exist
-        CREATE INDEX IF NOT EXISTS schema_embeddings_embedding_idx 
-        ON schema_embeddings 
-        USING ivfflat (embedding vector_cosine_ops)
-        WITH (lists = 100);
         """)
+        
+        # Create index for faster similarity search if it doesn't exist
+        try:
+            vector_cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS schema_embeddings_embedding_idx 
+            ON schema_embeddings 
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+            """)
+        except Exception as e:
+            # Log the error but continue - index is for performance only
+            print(f"Error creating index: {str(e)}")
         
         # Clear existing embeddings for this connection
         vector_cursor.execute(
-            "DELETE FROM schema_embeddings",
-            (str(connection_id),)
+            "DELETE FROM schema_embeddings"
         )
         
         # Store embeddings in vector database
@@ -186,8 +198,8 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
             vector_cursor.execute(
                 """
                 INSERT INTO schema_embeddings
-                (element_type, table_schema, table_name, column_name, data_type, description, embedding, connection_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (element_type, table_schema, table_name, column_name, data_type, description, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     item['type'],
@@ -204,25 +216,83 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         vector_cursor.close()
         vector_conn.close()
         
-        db.commit()
-        
-        return {
+        result = {
             "status": "success", 
             "message": f"Successfully stored {len(all_schema_items)} schema embeddings",
             "tables_processed": len(tables),
             "embeddings_created": len(all_schema_items)
         }
+        
+        # Update connection in database
+        connection.schema_status = "completed"
+        connection.schema_details = {
+            "tables_processed": len(tables),
+            "embeddings_created": len(all_schema_items)
+        }
+        db.commit()
+        
+        return result
     
     except Exception as e:
-        return {"status": "error", "message": f"Error extracting schema: {str(e)}"}
+        error_message = f"Error extracting schema: {str(e)}"
+        
+        # Update connection in database
+        connection.schema_status = "failed"
+        connection.schema_error = error_message
+        db.commit()
+        
+        return {"status": "error", "message": error_message}
+
+def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.UUID):
+    """Background task for schema extraction"""
+    # Create a new database session for this background task
+    db = next(get_db())
+    
+    try:
+        # Get the connection
+        connection = db.query(DatabaseConnection).filter(
+            DatabaseConnection.id == connection_id,
+            DatabaseConnection.user_id == user_id
+        ).first()
+        
+        if not connection:
+            print(f"Connection {connection_id} not found for background task")
+            return
+        
+        # Update connection status
+        connection.schema_status = "processing"
+        db.commit()
+        
+        # Run the extraction
+        extract_and_embed_schema(connection_id, user_id, db)
+        
+    except Exception as e:
+        error_message = f"Error in background task: {str(e)}"
+        print(error_message)
+        
+        try:
+            connection = db.query(DatabaseConnection).filter(
+                DatabaseConnection.id == connection_id
+            ).first()
+            
+            if connection:
+                connection.schema_status = "failed"
+                connection.schema_error = error_message
+                db.commit()
+        except Exception as inner_e:
+            print(f"Error updating connection status: {str(inner_e)}")
+    
+    finally:
+        db.close()
 
 @router.post("/", response_model=ExtendedConnectionResponse, status_code=status.HTTP_201_CREATED)
 def create_connection(
     connection: ConnectionCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Create a new database connection with validation and schema extraction"""
+    """Create a new database connection with validation and background schema extraction"""
     # Validate both database URLs
     vector_db_validation = validate_db_url(connection.vector_db_url, "Vector database")
     target_db_validation = validate_db_url(connection.target_db_url, "Target database")
@@ -247,25 +317,28 @@ def create_connection(
         name=connection.name,
         vector_db_url=connection.vector_db_url,
         target_db_url=connection.target_db_url,
+        schema_status="pending"
     )
     
     db.add(db_connection)
     db.commit()
     db.refresh(db_connection)
     
-    # Extract and embed schema
-    schema_result = extract_and_embed_schema(db_connection.id, current_user.id, db)
+    # Schedule schema extraction as a background task
+    background_tasks.add_task(
+        extract_and_embed_schema_background,
+        connection_id=db_connection.id,
+        user_id=current_user.id
+    )
     
-    # Refresh the connection to get updated is_schema_extracted value
-    db.refresh(db_connection)
-    
-    # Return extended response with extraction details
+    # Return the connection immediately with pending status
     return ExtendedConnectionResponse(
         id=db_connection.id,
         name=db_connection.name,
         vector_db_url=db_connection.vector_db_url,
         target_db_url=db_connection.target_db_url,
-        schema_extraction=schema_result
+        schema_status="pending",
+        schema_extraction={"status": "pending", "message": "Schema extraction started in background"}
     )
 
 @router.get("/", response_model=List[ConnectionResponse])
@@ -300,6 +373,31 @@ def get_connection(
     
     return connection
 
+@router.get("/{connection_id}/status", response_model=SchemaStatusResponse)
+def get_extraction_status(
+    connection_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get the schema extraction status for a specific connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id,
+        DatabaseConnection.user_id == current_user.id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Connection not found"
+        )
+    
+    return SchemaStatusResponse(
+        connection_id=connection.id,
+        name=connection.name,
+        status=connection.schema_status or "unknown",
+        error=connection.schema_error
+    )
+
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_connection(
     connection_id: uuid.UUID,
@@ -323,13 +421,14 @@ def delete_connection(
     
     return None
 
-@router.post("/{connection_id}/extract", response_model=Dict[str, Any])
+@router.post("/{connection_id}/extract", response_model=SchemaStatusResponse)
 def extract_schema(
     connection_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Extract schema from a database connection (kept for backward compatibility)"""
+    """Start schema extraction in the background for an existing connection"""
     # Check if connection exists
     connection = db.query(DatabaseConnection).filter(
         DatabaseConnection.id == connection_id,
@@ -342,114 +441,21 @@ def extract_schema(
             detail="Connection not found"
         )
     
-    # Extract schema
-    result = extract_and_embed_schema(connection_id, current_user.id, db)
+    # Update connection status
+    connection.schema_status = "pending"
+    connection.schema_error = None
+    connection.schema_details = None
+    db.commit()
     
-    return {
-        "connection_id": connection_id,
-        "status": result["status"],
-        "message": result["message"]
-    }
-
-# # app/api/routes/connections.py
-# from fastapi import APIRouter, Depends, HTTPException, status
-# from sqlalchemy.orm import Session
-# import uuid
-# from typing import List
-# from pydantic import BaseModel
-# from app.db.database import get_db
-# from app.db.models import DatabaseConnection, User
-# from app.core.auth import get_current_user
-
-# router = APIRouter(prefix="/api/connections", tags=["connections"])
-
-# # Pydantic models for request/response
-# class ConnectionCreate(BaseModel):
-#     name: str
-#     vector_db_url: str
-#     target_db_url: str
-
-# class ConnectionResponse(BaseModel):
-#     id: uuid.UUID
-#     name: str
-#     vector_db_url: str
-#     target_db_url: str
+    # Schedule schema extraction as a background task
+    background_tasks.add_task(
+        extract_and_embed_schema_background,
+        connection_id=connection_id,
+        user_id=current_user.id
+    )
     
-#     class Config:
-#         from_attributes = True
-
-# @router.post("/", response_model=ConnectionResponse, status_code=status.HTTP_201_CREATED)
-# def create_connection(
-#     connection: ConnectionCreate,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """Create a new database connection"""
-#     db_connection = DatabaseConnection(
-#         id=uuid.uuid4(),
-#         user_id=current_user.id,
-#         name=connection.name,
-#         vector_db_url=connection.vector_db_url,
-#         target_db_url=connection.target_db_url
-#     )
-    
-#     db.add(db_connection)
-#     db.commit()
-#     db.refresh(db_connection)
-    
-#     return db_connection
-
-# @router.get("/", response_model=List[ConnectionResponse])
-# def get_connections(
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """Get all database connections for the current user"""
-#     connections = db.query(DatabaseConnection).filter(
-#         DatabaseConnection.user_id == current_user.id
-#     ).all()
-    
-#     return connections
-
-# @router.get("/{connection_id}", response_model=ConnectionResponse)
-# def get_connection(
-#     connection_id: uuid.UUID,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """Get a specific database connection"""
-#     connection = db.query(DatabaseConnection).filter(
-#         DatabaseConnection.id == connection_id,
-#         DatabaseConnection.user_id == current_user.id
-#     ).first()
-    
-#     if not connection:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="Connection not found"
-#         )
-    
-#     return connection
-
-# @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
-# def delete_connection(
-#     connection_id: uuid.UUID,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """Delete a database connection"""
-#     connection = db.query(DatabaseConnection).filter(
-#         DatabaseConnection.id == connection_id,
-#         DatabaseConnection.user_id == current_user.id
-#     ).first()
-    
-#     if not connection:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="Connection not found"
-#         )
-    
-#     db.delete(connection)
-#     db.commit()
-    
-#     return None
+    return SchemaStatusResponse(
+        connection_id=connection_id,
+        name=connection.name,
+        status="pending"
+    )

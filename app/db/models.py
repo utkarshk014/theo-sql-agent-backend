@@ -31,6 +31,10 @@ class DatabaseConnection(Base):
     vector_db_url = Column(Text, nullable=False)
     target_db_url = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    schema_status = Column(String, nullable=True, default="pending")  # pending, processing, completed, failed
+    schema_error = Column(Text, nullable=True)
+    schema_details = Column(JSON, nullable=True)
     
     # Relationships
     user = relationship("User", back_populates="connections")
