@@ -261,10 +261,12 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
 
 def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.UUID):
     """Background task for schema extraction"""
+    print(f"[BACKGROUND TASK] Starting schema extraction for connection {connection_id}")
     # Create a new database session for this background task
     db = next(get_db())
     
     try:
+        print(f"[BACKGROUND TASK] Fetching connection {connection_id}")
         # Get the connection
         connection = db.query(DatabaseConnection).filter(
             DatabaseConnection.id == connection_id,
@@ -276,11 +278,13 @@ def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.
             return
         
         # Update connection status
+        print(f"[BACKGROUND TASK] Updating connection status to processing")
         connection.schema_status = "processing"
         db.commit()
         
         # Run the extraction
         extract_and_embed_schema(connection_id, user_id, db)
+        print(f"[BACKGROUND TASK] Extraction completed with status: {result['status']}")
         
     except Exception as e:
         error_message = f"Error in background task: {str(e)}"
@@ -299,6 +303,7 @@ def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.
             print(f"Error updating connection status: {str(inner_e)}")
     
     finally:
+        print(f"[BACKGROUND TASK] Closing database session")
         db.close()
 
 @router.post("/", response_model=ExtendedConnectionResponse, status_code=status.HTTP_201_CREATED)
