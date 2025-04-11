@@ -49,6 +49,7 @@ def validate_db_url(db_url: str, db_type: str) -> Dict[str, Any]:
 
 def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: Session) -> Dict[str, Any]:
     """Extract schema from source database and store embeddings in vector database"""
+    print(f"[SCHEMA EXTRACTION] Starting for connection ID: {connection_id}")
     # Get the connection details
     connection = db.query(DatabaseConnection).filter(
         DatabaseConnection.id == connection_id,
@@ -56,12 +57,16 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
     ).first()
     
     if not connection:
+        print(f"[SCHEMA EXTRACTION] ERROR: Connection {connection_id} not found")
         return {"status": "error", "message": "Connection not found"}
     
     try:
+        print(f"[SCHEMA EXTRACTION] Connecting to source database: {connection.target_db_url[:20]}...")
         # Connect to the source database (user's target DB)
         source_conn = psycopg2.connect(connection.target_db_url)
         source_cursor = source_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        print(f"[SCHEMA EXTRACTION] Connected to source DB. Extracting schema...")
         
         # Query to extract schema information
         query = """
@@ -83,11 +88,13 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         
         source_cursor.execute(query)
         schema_rows = source_cursor.fetchall()
-        
+        print(f"[SCHEMA EXTRACTION] Fetched {len(schema_rows)} rows from schema")
+
         # Clean up source database connection
         source_cursor.close()
         source_conn.close()
-        
+        print(f"[SCHEMA EXTRACTION] Closed source DB connection")
+
         # Group by table
         tables = {}
         for row in schema_rows:
@@ -96,14 +103,19 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
                 tables[table_key] = []
             tables[table_key].append(dict(row))
         
+        print(f"[SCHEMA EXTRACTION] Grouped into {len(tables)} tables")
+        print(f"[SCHEMA EXTRACTION] Configuring Gemini API")
         # Configure Gemini API
         genai.configure(api_key=settings.GEMINI_API_KEY)
         
         embedding_model = "models/embedding-001"
         all_schema_items = []
+
+        print(f"[SCHEMA EXTRACTION] Starting to process tables and generate embeddings")
         
         # Process each table
         for table_key, columns in enumerate(tables.items()):
+            print(f"[SCHEMA EXTRACTION] Processing table: {table_key}")
             table_key, columns = columns  # Unpack the tuple
             # Create table description
             table_desc = f"Table {table_key} with columns: {', '.join(col['column_name'] for col in columns)}"
@@ -147,10 +159,11 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
                     'description': col_desc,
                     'embedding': col_embedding,
                 })
-        
+        print(f"[SCHEMA EXTRACTION] Generated {len(all_schema_items)} embeddings. Connecting to vector DB...")
         # Connect to vector database
         vector_conn = psycopg2.connect(connection.vector_db_url)
         vector_cursor = vector_conn.cursor()
+        print(f"[SCHEMA EXTRACTION] Connected to vector DB")
 
         sample_embedding = genai.embed_content(
             model=embedding_model,
@@ -158,10 +171,12 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         )["embedding"]
 
         embedding_dimension = len(sample_embedding)
+        print(f"[SCHEMA EXTRACTION] Embedding dimension: {embedding_dimension}")
         
         # Ensure the vector extension is enabled
+        print(f"[SCHEMA EXTRACTION] Creating vector extension if needed")
         vector_cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        
+        print(f"[SCHEMA EXTRACTION] Creating schema_embeddings table if needed")
         # Create the schema_embeddings table if it doesn't exist
         vector_cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS schema_embeddings (
@@ -178,6 +193,7 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         
         # Create index for faster similarity search if it doesn't exist
         try:
+            print(f"[SCHEMA EXTRACTION] Creating vector index")
             vector_cursor.execute(f"""
             CREATE INDEX IF NOT EXISTS schema_embeddings_embedding_idx 
             ON schema_embeddings 
@@ -192,7 +208,7 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
         vector_cursor.execute(
             "DELETE FROM schema_embeddings"
         )
-        
+        print(f"[SCHEMA EXTRACTION] Storing {len(all_schema_items)} embeddings in vector DB")
         # Store embeddings in vector database
         for item in all_schema_items:
             vector_cursor.execute(
@@ -211,11 +227,11 @@ def extract_and_embed_schema(connection_id: uuid.UUID, user_id: uuid.UUID, db: S
                     item['embedding']
                 )
             )
-        
+        print(f"[SCHEMA EXTRACTION] Committing vector DB changes")
         vector_conn.commit()
         vector_cursor.close()
         vector_conn.close()
-        
+        print(f"[SCHEMA EXTRACTION] Closed vector DB connection")
         result = {
             "status": "success", 
             "message": f"Successfully stored {len(all_schema_items)} schema embeddings",
