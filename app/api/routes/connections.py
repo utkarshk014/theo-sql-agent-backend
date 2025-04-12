@@ -263,9 +263,8 @@ def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.
     """Background task for schema extraction"""
     print(f"[BACKGROUND TASK] Starting schema extraction for connection {connection_id}")
     # Create a new database session for this background task
-    db = next(get_db())
-    
     try:
+        db = next(get_db())
         print(f"[BACKGROUND TASK] Fetching connection {connection_id}")
         # Get the connection
         connection = db.query(DatabaseConnection).filter(
@@ -283,28 +282,16 @@ def extract_and_embed_schema_background(connection_id: uuid.UUID, user_id: uuid.
         db.commit()
         
         # Run the extraction
-        extract_and_embed_schema(connection_id, user_id, db)
+        result = extract_and_embed_schema(connection_id, user_id, db)
         print(f"[BACKGROUND TASK] Extraction completed with status: {result['status']}")
+        db.close()
         
     except Exception as e:
         error_message = f"Error in background task: {str(e)}"
         print(error_message)
-        
-        try:
-            connection = db.query(DatabaseConnection).filter(
-                DatabaseConnection.id == connection_id
-            ).first()
-            
-            if connection:
-                connection.schema_status = "failed"
-                connection.schema_error = error_message
-                db.commit()
-        except Exception as inner_e:
-            print(f"Error updating connection status: {str(inner_e)}")
     
     finally:
         print(f"[BACKGROUND TASK] Closing database session")
-        db.close()
 
 @router.post("/", response_model=ExtendedConnectionResponse, status_code=status.HTTP_201_CREATED)
 def create_connection(
@@ -313,6 +300,7 @@ def create_connection(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    print("[API] create_connection endpoint called")
     """Create a new database connection with validation and background schema extraction"""
     # Validate both database URLs
     vector_db_validation = validate_db_url(connection.vector_db_url, "Vector database")
